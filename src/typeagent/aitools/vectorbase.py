@@ -19,9 +19,9 @@ DEFAULT_MIN_SCORE = 0.25
 # These values come from repeated runs of the Adrian Tchaikovsky Episode 53
 # search benchmark in `tools/benchmark_embeddings.py`, with raw outputs stored
 # under `benchmark_results/`.
-# They are intended as repository defaults for known models, not universal
-# truths; callers can always override `min_score` explicitly for their own use
-# cases or models.
+# They reflect that narrow retrieval benchmark only. Separate end-to-end evals
+# have performed better with a stricter 0.7 cutoff in the message-text query
+# path, so these values are not an answer-quality recommendation.
 MODEL_DEFAULT_MIN_SCORES: dict[str, float] = {
     "text-embedding-3-large": 0.25,
     "text-embedding-3-small": 0.25,
@@ -256,7 +256,7 @@ class VectorBase:
             return
         if self._embedding_size == 0:
             if data.ndim < 2 or data.shape[0] == 0:
-                # Empty data can't determine size; just clear.
+                # Empty data — can't determine size; just clear.
                 self.clear()
                 return
             self._set_embedding_size(data.shape[1])

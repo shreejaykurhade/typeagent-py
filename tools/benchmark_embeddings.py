@@ -1,41 +1,78 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Benchmark retrieval settings for known embedding models.
+"""Benchmark embedding settings on retrieval-only or true end-to-end evals.
 
-This script evaluates the Adrian Tchaikovsky Episode 53 search dataset in
-`tests/testdata/` and reports retrieval quality for combinations of
-`min_score` and `max_hits`.
+This script evaluates combinations of `min_score` and `max_hits` for the
+Episode 53 dataset in `tests/testdata/`.
 
-The benchmark is intentionally narrow:
-- It only measures retrieval against `messageMatches` ground truth.
-- It is meant to help choose repository defaults for known models.
-- In practice, `min_score` is the primary library default this informs.
-- It does not prove universal "best" settings for every dataset.
+Two benchmark modes are supported:
+- `answer` (default): run the full slow eval path used by `make eval`
+- `retrieval`: run the narrower `messageMatches` retrieval benchmark
+
+The answer mode is the one to use when choosing settings for better final
+answers. The retrieval mode is still useful for quick diagnostics, but it does
+not prove that a row is best for end-to-end answer quality.
 
 Usage:
     uv run python tools/benchmark_embeddings.py
+    uv run python tools/benchmark_embeddings.py --mode retrieval
     uv run python tools/benchmark_embeddings.py --model openai:text-embedding-3-small
 """
 
 import argparse
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 from statistics import mean
+import time
+from typing import Literal
 
 from dotenv import load_dotenv
 
+import typechat
+
+from typeagent.aitools import model_adapters, utils
 from typeagent.aitools.embeddings import IEmbeddingModel, NormalizedEmbeddings
 from typeagent.aitools.model_adapters import create_embedding_model
 from typeagent.aitools.vectorbase import TextEmbeddingIndexSettings, VectorBase
+from typeagent.knowpro import (
+    answer_response_schema,
+    answers,
+    search_query_schema,
+    searchlang,
+    secindex,
+)
+from typeagent.knowpro.convsettings import ConversationSettings
+from typeagent.podcasts.podcast import Podcast
+from typeagent.storage.memory.convthreads import ConversationThreads
+from typeagent.storage.utils import create_storage_provider
 
 DEFAULT_MIN_SCORES = [0.25, 0.30, 0.35, 0.40, 0.50, 0.60, 0.70, 0.75, 0.80, 0.85]
 DEFAULT_MAX_HITS = [5, 10, 15, 20]
 DATA_DIR = Path("tests") / "testdata"
 INDEX_DATA_PATH = DATA_DIR / "Episode_53_AdrianTchaikovsky_index_data.json"
+INDEX_PREFIX_PATH = DATA_DIR / "Episode_53_AdrianTchaikovsky_index"
 SEARCH_RESULTS_PATH = DATA_DIR / "Episode_53_Search_results.json"
+ANSWER_RESULTS_PATH = DATA_DIR / "Episode_53_Answer_results.json"
+DEFAULT_SEARCH_OPTIONS = searchlang.LanguageSearchOptions(
+    compile_options=searchlang.LanguageQueryCompileOptions(
+        exact_scope=False,
+        verb_scope=True,
+        term_filter=None,
+        apply_scope=True,
+    ),
+    exact_match=False,
+    max_message_matches=25,
+)
+DEFAULT_ANSWER_OPTIONS = answers.AnswerContextOptions(
+    entities_top_k=50,
+    topics_top_k=50,
+    messages_top_k=None,
+    chunking=None,
+)
+type BenchmarkMode = Literal["answer", "retrieval"]
 
 
 @dataclass
@@ -45,16 +82,49 @@ class SearchQueryCase:
 
 
 @dataclass
+class AnswerQueryCase:
+    question: str
+    expected_answer: str
+    expected_success: bool
+
+
+@dataclass
 class SearchMetrics:
     hit_rate: float
     mean_reciprocal_rank: float
 
 
 @dataclass
-class BenchmarkRow:
+class AnswerMetrics:
+    mean_score: float
+    exact_or_near_rate: float
+    zero_score_rate: float
+    zero_score_count: int
+
+
+@dataclass
+class RetrievalBenchmarkRow:
     min_score: float
     max_hits: int
     metrics: SearchMetrics
+
+
+@dataclass
+class AnswerBenchmarkRow:
+    min_score: float
+    max_hits: int
+    metrics: AnswerMetrics
+
+
+@dataclass
+class TrueEvalContext:
+    conversation: Podcast
+    embedding_model: IEmbeddingModel
+    query_translator: typechat.TypeChatJsonTranslator[search_query_schema.SearchQuery]
+    answer_translator: typechat.TypeChatJsonTranslator[
+        answer_response_schema.AnswerResponse
+    ]
+    settings: ConversationSettings
 
 
 def parse_float_list(raw: str | None) -> list[float]:
@@ -97,6 +167,27 @@ def load_search_queries(repo_root: Path) -> list[SearchQueryCase]:
         if not expected_matches:
             continue
         cases.append(SearchQueryCase(search_text, expected_matches))
+    return cases
+
+
+def load_answer_queries(repo_root: Path) -> list[AnswerQueryCase]:
+    answer_data = json.loads(
+        (repo_root / ANSWER_RESULTS_PATH).read_text(encoding="utf-8")
+    )
+    cases: list[AnswerQueryCase] = []
+    for item in answer_data:
+        question = item.get("question")
+        answer = item.get("answer")
+        has_no_answer = item.get("hasNoAnswer")
+        if question is None or answer is None or has_no_answer is None:
+            continue
+        cases.append(
+            AnswerQueryCase(
+                question=question,
+                expected_answer=answer,
+                expected_success=not has_no_answer,
+            )
+        )
     return cases
 
 
@@ -154,7 +245,147 @@ def evaluate_search_queries(
     )
 
 
-def select_best_row(rows: list[BenchmarkRow]) -> BenchmarkRow:
+async def create_true_eval_context(
+    repo_root: Path,
+    model_spec: str | None,
+) -> TrueEvalContext:
+    embedding_model = create_embedding_model(model_spec)
+    settings = ConversationSettings(model=embedding_model)
+    settings.storage_provider = await create_storage_provider(
+        settings.message_text_index_settings,
+        settings.related_term_index_settings,
+        message_type=None,
+    )
+
+    raw_data = Podcast._read_conversation_data_from_file(
+        str(repo_root / INDEX_PREFIX_PATH)
+    )
+    raw_data.pop("messageIndexData", None)
+    raw_data.pop("relatedTermsIndexData", None)
+
+    conversation = await Podcast.create(settings)
+    await conversation.deserialize(raw_data)
+    await secindex.build_secondary_indexes(conversation, settings)
+
+    threads = (
+        conversation.secondary_indexes.threads
+        if conversation.secondary_indexes is not None
+        else None
+    )
+    if isinstance(threads, ConversationThreads) and threads.threads:
+        await threads.build_index()
+
+    chat_model = model_adapters.create_chat_model()
+    query_translator = utils.create_translator(
+        chat_model, search_query_schema.SearchQuery
+    )
+    answer_translator = utils.create_translator(
+        chat_model,
+        answer_response_schema.AnswerResponse,
+    )
+
+    return TrueEvalContext(
+        conversation=conversation,
+        embedding_model=embedding_model,
+        query_translator=query_translator,
+        answer_translator=answer_translator,
+        settings=settings,
+    )
+
+
+def answer_response_to_eval_tuple(
+    response: answer_response_schema.AnswerResponse,
+) -> tuple[str, bool]:
+    match response.type:
+        case "Answered":
+            return response.answer or "", True
+        case "NoAnswer":
+            return response.why_no_answer or "", False
+        case _:
+            raise ValueError(f"Unexpected answer type: {response.type}")
+
+
+async def score_answer_pair(
+    embedding_model: IEmbeddingModel,
+    expected: tuple[str, bool],
+    actual: tuple[str, bool],
+) -> float:
+    expected_text, expected_success = expected
+    actual_text, actual_success = actual
+
+    if expected_success != actual_success:
+        return 0.000 if expected_success else 0.001
+    if not actual_success:
+        return 1.001
+    if expected_text == actual_text:
+        return 1.000
+    if expected_text.lower() == actual_text.lower():
+        return 0.999
+
+    embeddings = await embedding_model.get_embeddings([expected_text, actual_text])
+    assert embeddings.shape[0] == 2, "Expected two embeddings"
+    return float(embeddings[0] @ embeddings[1])
+
+
+async def evaluate_answer_queries(
+    context: TrueEvalContext,
+    query_cases: list[AnswerQueryCase],
+    min_score: float,
+    max_hits: int,
+) -> AnswerMetrics:
+    context.settings.message_text_index_settings.embedding_index_settings.min_score = (
+        min_score
+    )
+    search_options = replace(DEFAULT_SEARCH_OPTIONS, max_message_matches=max_hits)
+
+    scores: list[float] = []
+    total = len(query_cases)
+    started_at = time.perf_counter()
+    for index, case in enumerate(query_cases, start=1):
+        if index == 1 or index % 5 == 0 or index == total:
+            elapsed = time.perf_counter() - started_at
+            print(
+                f"    Question {index}/{total} "
+                f"(elapsed {elapsed:.1f}s): {case.question}",
+                flush=True,
+            )
+        result = await searchlang.search_conversation_with_language(
+            context.conversation,
+            context.query_translator,
+            case.question,
+            search_options,
+        )
+        if isinstance(result, typechat.Failure):
+            actual = (f"Search failed: {result.message}", False)
+        else:
+            _, combined_answer = await answers.generate_answers(
+                context.answer_translator,
+                result.value,
+                context.conversation,
+                case.question,
+                options=DEFAULT_ANSWER_OPTIONS,
+            )
+            actual = answer_response_to_eval_tuple(combined_answer)
+
+        expected = (case.expected_answer, case.expected_success)
+        scores.append(
+            await score_answer_pair(context.embedding_model, expected, actual)
+        )
+
+    zero_score_count = sum(1 for score in scores if score <= 0.0)
+    exact_or_near_count = sum(1 for score in scores if score >= 0.97)
+
+    return AnswerMetrics(
+        mean_score=mean(scores),
+        exact_or_near_rate=(exact_or_near_count / len(scores)) * 100,
+        zero_score_rate=(zero_score_count / len(scores)) * 100,
+        zero_score_count=zero_score_count,
+    )
+
+
+def select_best_retrieval_row(
+    rows: list[RetrievalBenchmarkRow],
+) -> RetrievalBenchmarkRow:
     return max(
         rows,
         key=lambda row: (
@@ -166,9 +397,22 @@ def select_best_row(rows: list[BenchmarkRow]) -> BenchmarkRow:
     )
 
 
-def print_rows(rows: list[BenchmarkRow]) -> None:
+def select_best_answer_row(rows: list[AnswerBenchmarkRow]) -> AnswerBenchmarkRow:
+    return max(
+        rows,
+        key=lambda row: (
+            row.metrics.mean_score,
+            -row.metrics.zero_score_count,
+            row.metrics.exact_or_near_rate,
+            -row.min_score,
+            -row.max_hits,
+        ),
+    )
+
+
+def print_retrieval_rows(rows: list[RetrievalBenchmarkRow]) -> None:
     print("=" * 72)
-    print("SEARCH BENCHMARK (Episode 53 messageMatches ground truth)")
+    print("RETRIEVAL BENCHMARK (Episode 53 messageMatches ground truth)")
     print("=" * 72)
     print(f"{'Min Score':<12} | {'Max Hits':<10} | {'Hit Rate (%)':<15} | {'MRR':<10}")
     print("-" * 65)
@@ -181,15 +425,33 @@ def print_rows(rows: list[BenchmarkRow]) -> None:
     print("-" * 65)
 
 
-async def run_benchmark(
+def print_answer_rows(rows: list[AnswerBenchmarkRow]) -> None:
+    print("=" * 94)
+    print("TRUE EVAL BENCHMARK (Episode 53 full answer pipeline)")
+    print("=" * 94)
+    print(
+        f"{'Min Score':<12} | {'Max Hits':<10} | {'Mean Score':<12} | "
+        f"{'Exact/Near (%)':<15} | {'Zero Scores':<12} | {'Zero Rate (%)':<14}"
+    )
+    print("-" * 94)
+    for row in rows:
+        print(
+            f"{row.min_score:<12.2f} | {row.max_hits:<10d} | "
+            f"{row.metrics.mean_score:<12.4f} | "
+            f"{row.metrics.exact_or_near_rate:<15.2f} | "
+            f"{row.metrics.zero_score_count:<12d} | "
+            f"{row.metrics.zero_score_rate:<14.2f}"
+        )
+    print("-" * 94)
+
+
+async def run_retrieval_benchmark(
+    repo_root: Path,
     model_spec: str | None,
     min_scores: list[float],
     max_hits_values: list[int],
     batch_size: int,
 ) -> None:
-    load_dotenv()
-
-    repo_root = Path(__file__).resolve().parent.parent
     message_texts = load_message_texts(repo_root)
     query_cases = load_search_queries(repo_root)
     if not query_cases:
@@ -197,7 +459,7 @@ async def run_benchmark(
     model, vector_base = await build_vector_base(model_spec, message_texts, batch_size)
     query_embeddings = await model.get_embeddings([case.query for case in query_cases])
 
-    rows: list[BenchmarkRow] = []
+    rows: list[RetrievalBenchmarkRow] = []
     for min_score in min_scores:
         for max_hits in max_hits_values:
             metrics = evaluate_search_queries(
@@ -207,26 +469,121 @@ async def run_benchmark(
                 min_score,
                 max_hits,
             )
-            rows.append(BenchmarkRow(min_score, max_hits, metrics))
+            rows.append(RetrievalBenchmarkRow(min_score, max_hits, metrics))
 
+    print(f"Mode: retrieval")
     print(f"Model: {model.model_name}")
     print(f"Messages indexed: {len(message_texts)}")
     print(f"Queries evaluated: {len(query_cases)}")
     print()
-    print_rows(rows)
+    print_retrieval_rows(rows)
 
-    best_row = select_best_row(rows)
+    best_row = select_best_retrieval_row(rows)
     print()
-    print("Best-scoring benchmark row:")
+    print("Best-scoring retrieval row:")
     print(f"  min_score={best_row.min_score:.2f}")
     print(f"  max_hits={best_row.max_hits}")
     print(f"  hit_rate={best_row.metrics.hit_rate:.2f}%")
     print(f"  mrr={best_row.metrics.mean_reciprocal_rank:.4f}")
 
 
+async def run_answer_benchmark(
+    repo_root: Path,
+    model_spec: str | None,
+    min_scores: list[float],
+    max_hits_values: list[int],
+    limit: int,
+) -> None:
+    query_cases = load_answer_queries(repo_root)
+    if not query_cases:
+        raise ValueError("No answer eval cases found in the dataset")
+    if limit > 0:
+        query_cases = query_cases[:limit]
+
+    context = await create_true_eval_context(repo_root, model_spec)
+
+    rows: list[AnswerBenchmarkRow] = []
+    for min_score in min_scores:
+        for max_hits in max_hits_values:
+            row_started_at = time.perf_counter()
+            print(
+                f"Evaluating min_score={min_score:.2f}, max_hits={max_hits}...",
+                flush=True,
+            )
+            metrics = await evaluate_answer_queries(
+                context,
+                query_cases,
+                min_score,
+                max_hits,
+            )
+            rows.append(AnswerBenchmarkRow(min_score, max_hits, metrics))
+            row_elapsed = time.perf_counter() - row_started_at
+            print(
+                "  Completed row: "
+                f"mean_score={metrics.mean_score:.4f}, "
+                f"zero_scores={metrics.zero_score_count}, "
+                f"exact_or_near_rate={metrics.exact_or_near_rate:.2f}% "
+                f"in {row_elapsed:.1f}s",
+                flush=True,
+            )
+
+    print()
+    print(f"Mode: answer")
+    print(f"Model: {context.embedding_model.model_name}")
+    print(f"Queries evaluated: {len(query_cases)}")
+    print()
+    print_answer_rows(rows)
+
+    best_row = select_best_answer_row(rows)
+    print()
+    print("Best-scoring true-eval row:")
+    print(f"  min_score={best_row.min_score:.2f}")
+    print(f"  max_hits={best_row.max_hits}")
+    print(f"  mean_score={best_row.metrics.mean_score:.4f}")
+    print(f"  exact_or_near_rate={best_row.metrics.exact_or_near_rate:.2f}%")
+    print(f"  zero_score_count={best_row.metrics.zero_score_count}")
+    print(f"  zero_score_rate={best_row.metrics.zero_score_rate:.2f}%")
+
+
+async def run_benchmark(
+    mode: BenchmarkMode,
+    model_spec: str | None,
+    min_scores: list[float],
+    max_hits_values: list[int],
+    batch_size: int,
+    limit: int,
+) -> None:
+    load_dotenv()
+    repo_root = Path(__file__).resolve().parent.parent
+
+    if mode == "retrieval":
+        await run_retrieval_benchmark(
+            repo_root,
+            model_spec,
+            min_scores,
+            max_hits_values,
+            batch_size,
+        )
+    else:
+        await run_answer_benchmark(
+            repo_root,
+            model_spec,
+            min_scores,
+            max_hits_values,
+            limit,
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Benchmark retrieval settings for an embedding model."
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["answer", "retrieval"],
+        default="answer",
+        help="Use 'answer' for the slow true eval path or 'retrieval' for the narrow messageMatches benchmark.",
     )
     parser.add_argument(
         "--model",
@@ -250,16 +607,24 @@ def main() -> None:
         "--batch-size",
         type=int,
         default=16,
-        help="Batch size used when building the index.",
+        help="Batch size used when building the retrieval-only benchmark index.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Number of true-eval questions to run (default: all). Ignored in retrieval mode.",
     )
     args = parser.parse_args()
 
     asyncio.run(
         run_benchmark(
+            mode=args.mode,
             model_spec=args.model,
             min_scores=parse_float_list(args.min_scores),
             max_hits_values=parse_int_list(args.max_hits),
             batch_size=args.batch_size,
+            limit=args.limit,
         )
     )
 
