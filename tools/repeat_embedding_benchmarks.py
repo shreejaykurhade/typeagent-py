@@ -24,7 +24,6 @@ from statistics import mean
 from dotenv import load_dotenv
 
 from benchmark_embeddings import (
-    BenchmarkRow,
     build_vector_base,
     DEFAULT_MAX_HITS,
     DEFAULT_MIN_SCORES,
@@ -33,7 +32,8 @@ from benchmark_embeddings import (
     load_search_queries,
     parse_float_list,
     parse_int_list,
-    select_best_row,
+    RetrievalBenchmarkRow,
+    select_best_retrieval_row,
 )
 
 DEFAULT_MODELS = [
@@ -67,7 +67,7 @@ def sanitize_model_name(model_spec: str) -> str:
     return model_spec.replace(":", "__").replace("/", "_").replace("\\", "_")
 
 
-def benchmark_row_to_run_row(row: BenchmarkRow) -> RunRow:
+def benchmark_row_to_run_row(row: RetrievalBenchmarkRow) -> RunRow:
     return RunRow(
         min_score=row.min_score,
         max_hits=row.max_hits,
@@ -176,7 +176,7 @@ async def run_single_model_benchmark(
         query_embeddings = await model.get_embeddings(
             [case.query for case in query_cases]
         )
-        benchmark_rows: list[BenchmarkRow] = []
+        benchmark_rows: list[RetrievalBenchmarkRow] = []
         for min_score in min_scores:
             for max_hits in max_hits_values:
                 metrics = evaluate_search_queries(
@@ -186,9 +186,11 @@ async def run_single_model_benchmark(
                     min_score,
                     max_hits,
                 )
-                benchmark_rows.append(BenchmarkRow(min_score, max_hits, metrics))
+                benchmark_rows.append(
+                    RetrievalBenchmarkRow(min_score, max_hits, metrics)
+                )
 
-        best_row = select_best_row(benchmark_rows)
+        best_row = select_best_retrieval_row(benchmark_rows)
         run_result = RunResult(
             run_index=run_index,
             model_spec=model_spec,
