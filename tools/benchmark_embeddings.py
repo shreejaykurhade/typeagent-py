@@ -96,10 +96,20 @@ class SearchMetrics:
 
 @dataclass
 class AnswerMetrics:
-    mean_score: float
-    exact_or_near_rate: float
-    zero_score_rate: float
-    zero_score_count: int
+    answer_type_match_rate: float
+    exact_or_near_answer_rate: float
+    mean_semantic_similarity: float
+    no_answer_match_rate: float
+    classification_mismatch_rate: float
+    classification_mismatch_count: int
+
+
+@dataclass
+class AnswerScore:
+    answer_type_match: bool
+    no_answer_match: bool
+    exact_or_near_answer_match: bool
+    semantic_similarity: float | None
 
 
 @dataclass
@@ -133,6 +143,8 @@ def parse_float_list(raw: str | None) -> list[float]:
     values = [float(item.strip()) for item in raw.split(",") if item.strip()]
     if not values:
         raise ValueError("--min-scores must contain at least one value")
+    if any(value < 0.0 or value > 1.0 for value in values):
+        raise ValueError("--min-scores values must be between 0.0 and 1.0")
     return values
 
 
@@ -163,7 +175,13 @@ def load_search_queries(repo_root: Path) -> list[SearchQueryCase]:
         results = item.get("results", [])
         if not search_text or not results:
             continue
-        expected_matches = results[0].get("messageMatches", [])
+        expected_matches = sorted(
+            {
+                message_ordinal
+                for result in results
+                for message_ordinal in result.get("messageMatches", [])
+            }
+        )
         if not expected_matches:
             continue
         cases.append(SearchQueryCase(search_text, expected_matches))
@@ -309,22 +327,48 @@ async def score_answer_pair(
     embedding_model: IEmbeddingModel,
     expected: tuple[str, bool],
     actual: tuple[str, bool],
-) -> float:
+) -> AnswerScore:
     expected_text, expected_success = expected
     actual_text, actual_success = actual
 
     if expected_success != actual_success:
-        return 0.000 if expected_success else 0.001
+        return AnswerScore(
+            answer_type_match=False,
+            no_answer_match=False,
+            exact_or_near_answer_match=False,
+            semantic_similarity=None,
+        )
     if not actual_success:
-        return 1.001
+        return AnswerScore(
+            answer_type_match=True,
+            no_answer_match=True,
+            exact_or_near_answer_match=False,
+            semantic_similarity=None,
+        )
     if expected_text == actual_text:
-        return 1.000
+        return AnswerScore(
+            answer_type_match=True,
+            no_answer_match=False,
+            exact_or_near_answer_match=True,
+            semantic_similarity=1.0,
+        )
     if expected_text.lower() == actual_text.lower():
-        return 0.999
+        return AnswerScore(
+            answer_type_match=True,
+            no_answer_match=False,
+            exact_or_near_answer_match=True,
+            semantic_similarity=0.999,
+        )
 
     embeddings = await embedding_model.get_embeddings([expected_text, actual_text])
     assert embeddings.shape[0] == 2, "Expected two embeddings"
-    return float(embeddings[0] @ embeddings[1])
+    semantic_similarity = float(embeddings[0] @ embeddings[1])
+    return AnswerScore(
+        answer_type_match=True,
+        no_answer_match=False,
+        exact_or_near_answer_match=semantic_similarity >= 0.97,
+        semantic_similarity=semantic_similarity,
+    )
 
 
 async def evaluate_answer_queries(
@@ -333,12 +377,13 @@ async def evaluate_answer_queries(
     min_score: float,
     max_hits: int,
 ) -> AnswerMetrics:
-    context.settings.message_text_index_settings.embedding_index_settings.min_score = (
-        min_score
+    search_options = replace(
+        DEFAULT_SEARCH_OPTIONS,
+        max_message_matches=max_hits,
+        threshold_score=min_score,
     )
-    search_options = replace(DEFAULT_SEARCH_OPTIONS, max_message_matches=max_hits)
 
-    scores: list[float] = []
+    answer_scores: list[AnswerScore] = []
     total = len(query_cases)
     started_at = time.perf_counter()
     for index, case in enumerate(query_cases, start=1):
@@ -368,24 +413,41 @@ async def evaluate_answer_queries(
             actual = answer_response_to_eval_tuple(combined_answer)
 
         expected = (case.expected_answer, case.expected_success)
-        scores.append(
+        answer_scores.append(
             await score_answer_pair(context.embedding_model, expected, actual)
         )
 
-    zero_score_count = sum(1 for score in scores if score <= 0.0)
-    exact_or_near_count = sum(1 for score in scores if score >= 0.97)
+    answer_type_match_count = sum(
+        1 for score in answer_scores if score.answer_type_match
+    )
+    no_answer_match_count = sum(1 for score in answer_scores if score.no_answer_match)
+    exact_or_near_answer_count = sum(
+        1 for score in answer_scores if score.exact_or_near_answer_match
+    )
+    semantic_similarities = [
+        score.semantic_similarity
+        for score in answer_scores
+        if score.semantic_similarity is not None
+    ]
+    classification_mismatch_count = total - answer_type_match_count
 
     return AnswerMetrics(
-        mean_score=mean(scores),
-        exact_or_near_rate=(exact_or_near_count / len(scores)) * 100,
-        zero_score_rate=(zero_score_count / len(scores)) * 100,
-        zero_score_count=zero_score_count,
+        answer_type_match_rate=(answer_type_match_count / total) * 100,
+        exact_or_near_answer_rate=(exact_or_near_answer_count / total) * 100,
+        mean_semantic_similarity=(
+            mean(semantic_similarities) if semantic_similarities else 0.0
+        ),
+        no_answer_match_rate=(no_answer_match_count / total) * 100,
+        classification_mismatch_rate=(classification_mismatch_count / total) * 100,
+        classification_mismatch_count=classification_mismatch_count,
     )
 
 
 def select_best_retrieval_row(
     rows: list[RetrievalBenchmarkRow],
 ) -> RetrievalBenchmarkRow:
+    # Prefer stricter thresholds and smaller hit limits only after primary
+    # retrieval metrics tie.
     return max(
         rows,
         key=lambda row: (
@@ -398,12 +460,16 @@ def select_best_retrieval_row(
 
 
 def select_best_answer_row(rows: list[AnswerBenchmarkRow]) -> AnswerBenchmarkRow:
+    # Prefer stricter thresholds and smaller hit limits only after the answer
+    # quality metrics tie.
     return max(
         rows,
         key=lambda row: (
-            row.metrics.mean_score,
-            -row.metrics.zero_score_count,
-            row.metrics.exact_or_near_rate,
+            row.metrics.answer_type_match_rate,
+            row.metrics.exact_or_near_answer_rate,
+            row.metrics.mean_semantic_similarity,
+            row.metrics.no_answer_match_rate,
+            -row.metrics.classification_mismatch_count,
             -row.min_score,
             -row.max_hits,
         ),
@@ -426,23 +492,26 @@ def print_retrieval_rows(rows: list[RetrievalBenchmarkRow]) -> None:
 
 
 def print_answer_rows(rows: list[AnswerBenchmarkRow]) -> None:
-    print("=" * 94)
+    print("=" * 138)
     print("TRUE EVAL BENCHMARK (Episode 53 full answer pipeline)")
-    print("=" * 94)
+    print("=" * 138)
     print(
-        f"{'Min Score':<12} | {'Max Hits':<10} | {'Mean Score':<12} | "
-        f"{'Exact/Near (%)':<15} | {'Zero Scores':<12} | {'Zero Rate (%)':<14}"
+        f"{'Min Score':<12} | {'Max Hits':<10} | {'Type Match (%)':<15} | "
+        f"{'Exact/Near Ans (%)':<19} | {'Mean Similarity':<16} | "
+        f"{'No-Answer (%)':<14} | {'Mismatch Count':<14} | {'Mismatch (%)':<12}"
     )
-    print("-" * 94)
+    print("-" * 138)
     for row in rows:
         print(
             f"{row.min_score:<12.2f} | {row.max_hits:<10d} | "
-            f"{row.metrics.mean_score:<12.4f} | "
-            f"{row.metrics.exact_or_near_rate:<15.2f} | "
-            f"{row.metrics.zero_score_count:<12d} | "
-            f"{row.metrics.zero_score_rate:<14.2f}"
+            f"{row.metrics.answer_type_match_rate:<15.2f} | "
+            f"{row.metrics.exact_or_near_answer_rate:<19.2f} | "
+            f"{row.metrics.mean_semantic_similarity:<16.4f} | "
+            f"{row.metrics.no_answer_match_rate:<14.2f} | "
+            f"{row.metrics.classification_mismatch_count:<14d} | "
+            f"{row.metrics.classification_mismatch_rate:<12.2f}"
         )
-    print("-" * 94)
+    print("-" * 138)
 
 
 async def run_retrieval_benchmark(
@@ -520,9 +589,9 @@ async def run_answer_benchmark(
             row_elapsed = time.perf_counter() - row_started_at
             print(
                 "  Completed row: "
-                f"mean_score={metrics.mean_score:.4f}, "
-                f"zero_scores={metrics.zero_score_count}, "
-                f"exact_or_near_rate={metrics.exact_or_near_rate:.2f}% "
+                f"type_match_rate={metrics.answer_type_match_rate:.2f}%, "
+                f"exact_or_near_answer_rate={metrics.exact_or_near_answer_rate:.2f}%, "
+                f"mean_similarity={metrics.mean_semantic_similarity:.4f} "
                 f"in {row_elapsed:.1f}s",
                 flush=True,
             )
@@ -539,10 +608,19 @@ async def run_answer_benchmark(
     print("Best-scoring true-eval row:")
     print(f"  min_score={best_row.min_score:.2f}")
     print(f"  max_hits={best_row.max_hits}")
-    print(f"  mean_score={best_row.metrics.mean_score:.4f}")
-    print(f"  exact_or_near_rate={best_row.metrics.exact_or_near_rate:.2f}%")
-    print(f"  zero_score_count={best_row.metrics.zero_score_count}")
-    print(f"  zero_score_rate={best_row.metrics.zero_score_rate:.2f}%")
+    print(f"  answer_type_match_rate={best_row.metrics.answer_type_match_rate:.2f}%")
+    print(
+        "  exact_or_near_answer_rate="
+        f"{best_row.metrics.exact_or_near_answer_rate:.2f}%"
+    )
+    print(
+        "  mean_semantic_similarity=" f"{best_row.metrics.mean_semantic_similarity:.4f}"
+    )
+    print(f"  no_answer_match_rate={best_row.metrics.no_answer_match_rate:.2f}%")
+    print(
+        "  classification_mismatch_count="
+        f"{best_row.metrics.classification_mismatch_count}"
+    )
 
 
 async def run_benchmark(
